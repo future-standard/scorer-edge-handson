@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+
+
+# This script tests OpenCV's GStreamer support from Python3
+
+
+
+import sys
+import argparse
+import zmq
+import time
+import cv2
+import re
+
+
+
+
+# Handle arguments
+
+PROG_DESCRIPTION='''\
+description:
+  this program generates a test video stream to the data consumer
+  such as a filter or a sink queue.  the stream is computed
+  by GStreamer's "videotestsrc" element.
+
+  the video data can be transmitted to multiple ZeroMQ endpoints
+  by the publisher/subscriber model.
+'''
+
+PROG_EPILOG='''\
+
+examples:
+  %(prog)s
+  %(prog)s -oc ipc://@/scorer/dealer
+  %(prog)s -oc tcp://192.168.10.11:6789 tcp://192.168.10.12:6780
+  %(prog)s -ob 'tcp://*:6789' --imshow
+  %(prog)s --width 1920 --height 1080 --framerate 30/1
+  %(prog)s --id 'TestVideo3'
+'''
+
+DEFAULT_EGRESS_ADDR="tcp://localhost:6789"
+DEFAULT_STREAM_ID="test0"
+DEFAULT_WATCHDOG_TIMEOUT=30.0
+DEFAULT_WIDTH=800
+DEFAULT_HEIGHT=600
+DEFAULT_FRAMERATE="15/1"        # 15fps = one frame per every 67msec
+DEFAULT_INTERVAL=0.0
+DEFAULT_JPEG_QUALITY=85
+DEFAULT_STATS_INTERVAL=0.0
+
+ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=PROG_DESCRIPTION,
+        epilog=PROG_EPILOG)
+
+ap.add_argument('-v','--verbose', action='count', default=0, help='increase verbosity')
+
+apg1 = ap.add_argument_group()
+apmx = apg1.add_mutually_exclusive_group()
+apmx.add_argument('-oc', dest='connects', metavar='ADDR', nargs='+', action='append',
+                  help='specify a ZMQ endpoint to connect to a data consumer (default:"{}")'
+                       .format(DEFAULT_EGRESS_ADDR))
+apmx.add_argument('-ob', dest='binds', metavar='ADDR', nargs='+', action='append',
+                  help='specify a ZMQ endpoint to bind for data consumers')
+
+apg2 = ap.add_argument_group()
+apg2.add_argument('--width', metavar='W', type=int, default=DEFAULT_WIDTH,
+                  help='specify the width of the video (default:%(default)s)')
+apg2.add_argument('--height', metavar='H', type=int, default=DEFAULT_HEIGHT,
+                  help='specify the height of the video (default:%(default)s)')
+apg2.add_argument('--framerate', metavar='FPS', default=DEFAULT_FRAMERATE,
+                  help='specify the framerate of the video (default:"%(default)s")')
+apg2.add_argument('--id', metavar='STREAM_ID', default=DEFAULT_STREAM_ID,
+                  help='set the video stream ID (default:"%(default)s")')
+
+apg3 = ap.add_argument_group()
+apg3.add_argument('--watchdog', metavar='SEC', type=float, default=DEFAULT_WATCHDOG_TIMEOUT,
+                  help='specify the duration of no incoming data till exit (default:%(default)s)')
+apg3.add_argument('--interval', metavar='SEC', type=float, default=DEFAULT_INTERVAL,
+                  help='suppress the transmission for some interval (default:%(default)s)')
+apg3.add_argument('--jpeg', action='store_true',
+                  help='convert the video frames to JPEG before sending to data consumers')
+apg3.add_argument('--jpeg-quality', dest='jpeg_quality', metavar='LEVEL', type=int,
+                  default=DEFAULT_JPEG_QUALITY,
+                  help='specify the jpeg image quality (default:%(default)s)')
+apg3.add_argument('--measure-fps', dest='stats_interval', metavar='SEC', type=float,
+                  default=DEFAULT_STATS_INTERVAL,
+                  help='measure and dump the framerate for the interval')
+apg3.add_argument('--imshow', action='store_true',
+                  help='monitor the captured video')
+
+args = ap.parse_args()
+
+
+# Sanity checks
+if not args.id:
+    ap.error(message="the video stream ID is empty")
+if args.width < 320:
+    ap.error(message="the video width must be at least 320")
+if args.height < 240:
+    ap.error(message="the video height must be at least 240")
+if not re.fullmatch(r'[1-9][0-9]*/[1-9][0-9]*',args.framerate):
+    ap.error(message="the video framerate must be a fraction like n/m")
+if args.interval < 0.0:
+    ap.error(message="the interval must not be negative")
+if args.watchdog < 0.0:
+    ap.error(message="the watchdog duration must not be negative")
+if not 0 <= args.jpeg_quality <= 100:
+    ap.error(message="jpeg quality must be between 0 and 100")
+if args.stats_interval < 0.0:
+    ap.error(message="the fps interval must not be negative")
+
+
+# Flatten the lists
+if args.connects:
+    args.connects = sum(args.connects, [])
+    args.connects = [s for s in args.connects if s]
+if args.binds:
+    args.binds = sum(args.binds, [])
+    args.binds = [s for s in args.binds if s]
+
+# Set the default endpoint
+if not args.connects and not args.binds:
+    args.connects = [ DEFAULT_EGRESS_ADDR ]
+
+
+
+
+
+
+# --------------------------------
+# Live Streaming
+# --------------------------------
+RESOLUTION="width={},height={}".format(args.width,args.height)
+MAX_LATENCY=100*1000000000      # 100msec
+
+
+GST_PIPELINE='''\
+videotestsrc is-live=true
+    ! video/x-raw,{res},format=BGR,framerate={fps}
+    ! queue leaky=downstream max-size-time={latency}
+    ! timeoverlay halignment=left valignment=bottom draw-shadow=false
+    ! clockoverlay halignment=right valignment=bottom draw-shadow=false
+    ! watchdog timeout={tmout}
+    ! appsink drop=true max-lateness={latency}
+'''.format(res=RESOLUTION,fps=args.framerate,latency=MAX_LATENCY,tmout=int(args.watchdog*1000))
+
+print("Pipeline\n{0}\n{1}{0}".format("----------------",GST_PIPELINE))
+
+print('Watchdog is set to {} seconds\n'.format(args.watchdog))
+
+cap = cv2.VideoCapture(GST_PIPELINE)
+
+
+
+# --------------------------------
+# ZeroMQ
+# --------------------------------
+ctx = zmq.Context()
+
+sockq = ctx.socket(zmq.PUB)
+sockq.setsockopt(zmq.SNDHWM, 4)     # To deliver both log frame and image frame
+
+if type(args.connects) == list:
+    for addr in args.connects:
+        print('Egress:        Connecting to "{}"'.format(addr))
+        sockq.connect(addr)
+
+elif type(args.binds) == list:
+    for addr in args.binds:
+        print('Egress:        Binding to "{}"'.format(addr))
+        sockq.bind(addr)
+
+print("ZeroMQ is good\n")
+
+
+
+# --------------------------------
+# OpenCV and Debugging
+# --------------------------------
+WAIT_TIME=5             # milliseconds
+
+TOPIC_VIDEO_FRAME = b'VideoFrame'
+TOPIC_JPEG_FRAME = b'JpegFrame'
+TOPIC_LOG_FRAME = b'LogFrame'
+
+
+if args.jpeg:
+    print('JPEG Transmission Mode (quality {})'.format(args.jpeg_quality))
+    print('The pub topic for image frames is {}\n'.format(TOPIC_JPEG_FRAME))
+else:
+    print('BGR Transmission Mode')
+    print('The pub topic for image frames is {}\n'.format(TOPIC_VIDEO_FRAME))
+
+print('The pub topic for log frames is {}\n'.format(TOPIC_LOG_FRAME))
+
+
+print('Stream ID is "{}"'.format(args.id))
+print('Streaming now ...\n')
+
+
+
+def dprint(level_, *args_, **kwargs_):
+    if level_ <= 0:
+        print('Log level must be positive: {}'.format(level_))
+        sys.exit(1)
+
+    # args.verbose:
+    #    0: Suppress all debug logging
+    #    1: Show significant logs only
+    #    2: Show important logs
+    #    3: Show detailed logs
+    #    4: Show trace logs
+    if args.verbose >= level_:
+        print(*args_, **kwargs_)
+
+
+
+
+
+
+def publish_image(sock_, img_, annotation_, frame_time_):
+    if args.jpeg:
+        ret, jpeg = cv2.imencode('.jpg', img_, [int(cv2.IMWRITE_JPEG_QUALITY), args.jpeg_quality])
+        if ret:
+            img_ = jpeg
+        else:
+            dprint(1,'Failed to encode the image')
+            return
+
+        sock_.send(TOPIC_JPEG_FRAME, zmq.NOBLOCK | zmq.SNDMORE) # Pub Topic
+    else:
+        sock_.send(TOPIC_VIDEO_FRAME, zmq.NOBLOCK | zmq.SNDMORE)
+
+    sock_.send_string(args.id, zmq.NOBLOCK | zmq.SNDMORE)
+    sock_.send_pyobj(frame_time_, zmq.NOBLOCK | zmq.SNDMORE)
+
+    sock_.send_pyobj({ 'dtype': img_.dtype, 'shape': img_.shape },
+                     zmq.NOBLOCK | zmq.SNDMORE)
+    sock_.send(img_, zmq.NOBLOCK | zmq.SNDMORE)
+    sock_.send_pyobj(annotation_, zmq.NOBLOCK)
+
+    dprint(4,'publish_image ftime {:.3f} {} {}'
+             .format(frame_time_, img_.shape, annotation_))
+
+
+def publish_log(sock_, log_, frame_time_):
+    sock_.send(TOPIC_LOG_FRAME, zmq.NOBLOCK | zmq.SNDMORE)
+    sock_.send_string(args.id, zmq.NOBLOCK | zmq.SNDMORE)
+    sock_.send_pyobj(frame_time_, zmq.NOBLOCK | zmq.SNDMORE)
+    sock_.send_pyobj(log_, zmq.NOBLOCK)
+
+    dprint(4,'publish_log ftime {:.3f} {}'.format(frame_time_, log_))
+
+
+
+
+# The main thread handles window events
+
+
+try:    # for KeyboardInterrupt
+
+    win_title="{}: {}  {} fps".format(args.id, RESOLUTION, args.framerate)
+
+    # Stats of the captured video
+    received = 0
+    dropped = 0
+    sent = 0
+
+    last_stats_dumped = now = time.time()
+    last_sent = last_received = now
+
+    while True:
+
+        # Show the stats
+        if 0.0 < args.stats_interval and last_stats_dumped + args.stats_interval < now:
+            duration = now - last_stats_dumped
+            in_fps = (received - dropped) / duration
+            err_fps = dropped / duration
+            out_fps = sent / duration
+
+            if args.stats_interval >= 0.0:
+                print('{} received {} dropped -> {} sent | interval {:.3f}s | fps {:.3f} in {:.3f} err {:.3f} out'
+                      .format(received, dropped, sent, duration, in_fps, err_fps, out_fps), flush=True)
+
+            received = 0
+            dropped = 0
+            sent = 0
+            last_stats_dumped = now
+
+
+        # Capture the video frame
+        ret, img = cap.read()
+        if ret:
+            received += 1
+        else:
+            break
+
+        now = time.time()
+
+        if img is not None:
+            frame_time = last_received = now
+
+            if args.interval <= (now - last_sent):
+
+                # Send out the image
+                try:
+                    publish_log(sockq, {"frames":received,"now":now}, frame_time)
+                    publish_image(sockq, img, {"annotation":"sample"}, frame_time)
+
+                    last_sent = now
+
+                except zmq.ZMQError:
+                    # The data consumers may be full; we will not update the window
+                    dropped += 1
+                else:
+                    sent += 2   # Two for the image frame and the log frame
+                    if args.imshow:
+                        # Show the image
+                        cv2.imshow(win_title, img)
+
+        if args.watchdog <= (now - last_received):
+            print("No incoming data for more than {} seconds; exiting!"
+                  .format(args.watchdog))
+            break
+
+        if args.imshow:
+            # Handle window events
+            key = cv2.waitKey(WAIT_TIME)
+            if key == 27:
+                break
+        else:
+            time.sleep(WAIT_TIME / 1000.0)
+
+except KeyboardInterrupt:
+    print("\nKeyboardInterrupt\n", file=sys.stderr, flush=True)
+
+
+# Clean up
+if not sockq.closed:
+    sockq.setsockopt(zmq.LINGER, 0)
+    sockq.close()
+
+ctx.term()
+
+# EOF

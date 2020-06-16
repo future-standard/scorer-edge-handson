@@ -1,0 +1,646 @@
+#!/usr/bin/env python3
+
+
+# This script dumps various streams to the image or text files
+
+
+
+import sys
+import argparse
+import zmq
+import time
+import cv2
+import pickle
+import numpy
+import threading
+import queue
+import json
+import csv
+import os
+import re
+import tempfile
+
+
+
+
+# Handle arguments
+
+PROG_DESCRIPTION='''\
+description:
+  this program subscribes stream sources and dumps to stdout, imshow, and files.
+'''
+
+PROG_EPILOG='''\
+
+examples:
+  %(prog)s
+  %(prog)s --imshow --out-images /data/out/images --out-logs /data/out/logs
+  %(prog)s --imshow --pretty-json -ib 'tcp://*:6789'
+  %(prog)s -ic tcp://192.168.10.11:9877 tcp://192.168.10.12:9877
+  %(prog)s -ib ipc://@/scorer/video-sink --subscribe test0
+'''
+
+DEFAULT_INGRESS_ADDR="tcp://localhost:6789"
+DEFAULT_INGRESS_TOPICS=[ 'VideoFrame', 'JpegFrame', 'LogFrame' ]
+
+DEFAULT_OUT_IMAGE_DIR='./out'
+DEFAULT_OUT_LOG_DIR='./out'
+DEFAULT_INHIBITION_PERIOD=0.0
+DEFAULT_LOG_DUMP_INTERVAL=180
+DEFAULT_TIMEZONE='Asia/Tokyo'
+DEFAULT_JPEG_QUALITY=85
+DEFAULT_STATS_INTERVAL=0.0
+
+
+
+ap = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=PROG_DESCRIPTION,
+        epilog=PROG_EPILOG)
+
+ap.add_argument('-v','--verbose', action='count', default=0, help='increase verbosity')
+
+apg1 = ap.add_argument_group()
+apmx1 = apg1.add_mutually_exclusive_group()
+apmx1.add_argument('-ic', dest='ingress_connects', metavar='ADDR', nargs='+', action='append',
+                   help='specify a ZMQ endpoint to connect to a data source (default:{})'
+                       .format(DEFAULT_INGRESS_ADDR))
+apmx1.add_argument('-ib', dest='ingress_binds', metavar='ADDR', nargs='+', action='append',
+                   help='specify a ZMQ endpoint to bind for data sources')
+
+apg2 = ap.add_argument_group()
+apg2.add_argument('--subscribe', dest='topics', metavar='TOPIC', nargs='+', action='append',
+                  help='specify the subscription topic of data sources (default:{})'
+                       .format(DEFAULT_INGRESS_TOPICS))
+
+apg3 = ap.add_argument_group()
+apg3.add_argument('--out-images', dest='image_dir', metavar='DIR', default=DEFAULT_OUT_IMAGE_DIR,
+                  help='save the image files to this directory (default:%(default)s)')
+apg3.add_argument('--out-logs', dest='log_dir', metavar='DIR', default=DEFAULT_OUT_LOG_DIR,
+                  help='save the log files to this directory (default:%(default)s)')
+apg3.add_argument('--file-id', dest='fname_keys', metavar='KEY[.KEY]*',
+                  help='choose the period-separated keys in annotations '
+                       'to put its value in the file name (default:Stream ID)')
+apg3.add_argument('--timezone', metavar='TZ', default=DEFAULT_TIMEZONE,
+                  help='set the timezone to be used for the file names (default:%(default)s)')
+apg3.add_argument('--inhibition', metavar='SEC', type=float, default=DEFAULT_INHIBITION_PERIOD,
+                  help='suppress the file save for this period after the last save (default:%(default)s)')
+apg3.add_argument('--log-dump', dest='log_dump_interval', metavar='SEC', type=int,
+                  default=DEFAULT_LOG_DUMP_INTERVAL,
+                  help='specify the duration till the log data are dumped to a file (default:%(default)s)')
+apg3.add_argument('--flatten', action='store_true',
+                  help='flatten the annotation data before writing to the log file')
+apg3.add_argument('--csv-key', dest='csv_keys', metavar='KEY', nargs='+', action='append',
+                   help='specify a CSV key to write the annotation to the log file (default:[])')
+apg3.add_argument('--jpeg', action='store_true',
+                  help='convert the video frames to JPEG before saving to files')
+apg3.add_argument('--jpeg-quality', dest='jpeg_quality', metavar='LEVEL', type=int,
+                  default=DEFAULT_JPEG_QUALITY,
+                  help='specify the jpeg image quality (default:%(default)s)')
+
+apg4 = ap.add_argument_group()
+apg4.add_argument('--measure-fps', dest='stats_interval', metavar='SEC', type=float,
+                  default=DEFAULT_STATS_INTERVAL,
+                  help='measure and dump the framerate for the interval')
+apg4.add_argument('--pretty-json', action='store_true',
+                  help='dump the json with sorted keys and indent')
+apg4.add_argument('--imshow', action='store_true',
+                  help='monitor the captured video')
+apg4.add_argument('-q', '--quiet', action='store_true',
+                  help='suppress the log output to stdout')
+
+args = ap.parse_args()
+
+
+# Sanity checks
+try:
+    fp = tempfile.TemporaryFile(dir=args.image_dir)
+    fp.close()
+except OSError as e:
+    ap.error(message='{}: {}'.format(e.strerror, args.image_dir))
+
+try:
+    fp = tempfile.TemporaryFile(dir=args.log_dir)
+    fp.close()
+except OSError as e:
+    ap.error(message='{}: {}'.format(e.strerror, args.log_dir))
+
+if args.inhibition < 0.0:
+    ap.error(message="the inhibition must not be negative")
+if args.log_dump_interval < 1:
+    ap.error(message="the log file dump interval must not be less than 1 second")
+if not 0 <= args.jpeg_quality <= 100:
+    ap.error(message="jpeg quality must be between 0 and 100")
+if args.stats_interval < 0.0:
+    ap.error(message="the fps interval must not be negative")
+
+
+
+# Flatten the lists
+if args.ingress_binds:
+    args.ingress_binds = sum(args.ingress_binds, [])
+    args.ingress_binds = [s for s in args.ingress_binds if s]
+if args.ingress_connects:
+    args.ingress_connects = sum(args.ingress_connects, [])
+    args.ingress_connects = [s for s in args.ingress_connects if s]
+if args.topics:
+    args.topics = sum(args.topics, [])
+    args.topics = [s for s in args.topics if s]
+if args.csv_keys:
+    args.csv_keys = sum(args.csv_keys, [])
+    args.csv_keys = [s for s in args.csv_keys if s]
+
+
+# Set the default endpoint
+if not args.ingress_connects and not args.ingress_binds:
+    args.ingress_connects = [ DEFAULT_INGRESS_ADDR ]
+
+# Set the default topic filter
+if not args.topics:
+    args.topics = DEFAULT_INGRESS_TOPICS
+
+# Set the timezone
+if args.timezone:
+    os.environ['TZ']=args.timezone
+    time.tzset()
+
+# Split the fname keys
+if args.fname_keys:
+    fname_keys = args.fname_keys.split('.')
+else:
+    fname_keys = []
+
+# Set the default file name extension
+if args.jpeg:
+    img_ext = '.jpg'
+else:
+    img_ext = '.bmp'
+
+if args.csv_keys:
+    log_ext = '.csv'
+    print('Log format is csv: {}\n'.format(args.csv_keys))
+else:
+    log_ext = '.jsonl'
+    print('Log format is jsonl\n')
+
+# Set the option for json.dumps
+if args.pretty_json:
+    json_opts = {'sort_keys': True, 'indent': 2}
+else:
+    json_opts = {'sort_keys': True}
+
+
+
+
+
+
+
+# --------------------------------
+# ZeroMQ
+# --------------------------------
+ctx = zmq.Context()
+
+
+
+# --------------------------------
+# Utility Functions and Constants
+# --------------------------------
+
+TOPIC_VIDEO_FRAME = b'VideoFrame'
+TOPIC_JPEG_FRAME = b'JpegFrame'
+TOPIC_LOG_FRAME = b'LogFrame'
+
+MAX_QUEUE_LEN = 300
+
+
+def dprint(level_, *args_, **kwargs_):
+    if level_ <= 0:
+        print('Log level must be positive: {}'.format(level_))
+        sys.exit(1)
+
+    # args.verbose:
+    #    0: Suppress all debug logging
+    #    1: Show significant logs only
+    #    2: Show important logs
+    #    3: Show detailed logs
+    #    4: Show trace logs
+    if args.verbose >= level_:
+        print(*args_, **kwargs_)
+
+
+def flatten_dict(d_, parent_keys_=''):
+    items = []
+
+    def flatten_list(l_, parent_keys_):
+        items = []
+
+        for i, v in enumerate(l_):
+            k2 = parent_keys_ + "." + str(i)
+
+            if isinstance(v, dict):
+                items.extend(flatten_dict(v, k2).items())
+            elif isinstance(v, list) or isinstance(v, set):
+                items.extend(flatten_list(v, k2).items())
+            else:
+                items.append((k2, v))
+
+        return dict(items)
+
+    for k,v in d_.items():
+        if parent_keys_:
+            k2 = parent_keys_ + "." + k
+        else:
+            k2 = k
+
+        if isinstance(v, dict):
+            items.extend(flatten_dict(v, k2).items())
+        elif isinstance(v, list) or isinstance(v, set):
+            items.extend(flatten_list(v, k2).items())
+        else:
+            items.append((k2, v))
+
+    return dict(items)
+
+
+# Usage:
+#  x = flatten_dict({'a': 1,
+#                    'c': {'a': 2, 'b': {'x': 5, 'y' : 10}},
+#                    'd': [1, 2, [3, 4, 5]],
+#                    'e': [{'a':'x'}, {'b','c','d'}, 3],
+#                    'f': {'r','s','t'}
+#                    })
+#
+#   print(x)
+#    ==> {'a': 1,
+#         'c.a': 2, 'c.b.x': 5, 'c.b.y': 10,
+#         'd.0': 1, 'd.1': 2, 'd.2.0': 3, 'd.2.1': 4, 'd.2.2': 5,
+#         'e.0.a': 'x', 'e.1.0': 'b', 'e.1.1': 'c', 'e.1.2': 'd', 'e.2': 3,
+#         'f.0': 'r', 'f.1': 's', 'f.2': 't'}
+
+
+
+
+
+
+invalid_chars = re.compile(r'(\s|/)')
+
+def save_one_image(source_id_, frame_time_, img_, annotation_):
+
+    # Compute the ID in the file name (the default is source_id_)
+    file_id = source_id_
+
+    if type(annotation_) is dict and len(fname_keys) > 0:
+
+        # Traverse annotation_ with frame_keys given by the user
+        kr = fname_keys[::-1]
+
+        v = annotation_
+        while kr:
+            k = kr.pop()
+            if k in v:
+                v = v[k]
+            else:
+                break
+
+        if len(kr) == 0 and type(v) is str:
+            file_id = v
+        else:
+            dprint(3, 'Cannot retrieve a string: {} in {}'
+                      .format(fname_keys, annotation_))
+
+    # Sanitize the file ID
+    file_id = invalid_chars.sub('', file_id)
+
+    # Compute the date time in the file name
+    msec = repr(frame_time_).split('.')[1][:3]
+    fname_time = time.strftime('%Y-%m-%d_%H:%M:%S.{}%z'.format(msec),
+                               time.localtime(frame_time_))
+
+    # Note that the dst file can be accidentally overwrite by a small chance
+    src = args.image_dir + '/transferring.' + fname_time + '_' + file_id + img_ext
+    dst = args.image_dir + '/' + fname_time + '_' + file_id + img_ext
+
+    ok = cv2.imwrite(src, img_, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality])
+
+    if ok:
+        try:
+            os.replace(src, dst)
+        except:
+            ok = False
+
+    if not ok:
+        try:
+            os.remove(src)
+        except:
+            pass
+
+    return ok
+
+
+
+def close_log_file(log_file_time_):
+
+    if log_file_time_ == 0:
+        return
+
+    msec = repr(log_file_time_).split('.')[1][:3]
+    file_time = time.strftime('%Y-%m-%d_%H:%M:%S.{}%z'.format(msec),
+                              time.localtime(log_file_time_))
+
+    src = args.log_dir + '/transferring.' + file_time + log_ext
+    dst = args.log_dir + '/' + file_time + log_ext
+
+    ok = True
+    try:
+        os.replace(src, dst)
+    except:
+        ok = False
+
+    if not ok:
+        try:
+            os.remove(src)
+        except:
+            pass
+
+    return ok
+
+
+
+
+
+def save_one_annotation(log_file_time_, source_id_, frame_time_, annotation_):
+    if log_file_time_ == 0:
+        return
+
+    msec = repr(log_file_time_).split('.')[1][:3]
+    file_time = time.strftime('%Y-%m-%d_%H:%M:%S.{}%z'.format(msec),
+                              time.localtime(log_file_time_))
+
+    dst = args.log_dir + '/transferring.' + file_time + log_ext
+
+    with open(dst, 'a') as f:
+        msec = repr(frame_time_).split('.')[1][:3]
+        ftime_str = time.strftime('%Y-%m-%d %H:%M:%S.{}%z'.format(msec),
+                                  time.localtime(frame_time_))
+
+        mandatory_fields = {'datetime': ftime_str,
+                            'frame_time': frame_time_,
+                            'source_id': source_id_}
+
+        if annotation_ and type(annotation_) is dict:
+            annotation_.update(mandatory_fields)
+        else:
+            annotation_ = mandatory_fields
+
+        if args.flatten:
+            annotation_ = flatten_dict(annotation_)
+
+        if args.csv_keys:
+            w = csv.DictWriter(f, fieldnames=args.csv_keys, extrasaction='ignore')
+            w.writerow(annotation_)
+        else:
+            f.write(json.dumps(annotation_) + '\n')
+
+
+
+
+
+# Queue between the main thread and the stream subscriber
+imgq = queue.Queue(MAX_QUEUE_LEN)
+
+
+
+
+
+# --------------------------------
+# Stream Subscriber
+# --------------------------------
+POLL_WAIT_TIME=300      # milliseconds
+
+
+
+stopped = False
+
+def subscribe_streams(imgq_):
+
+    # Setup the ingress socket for streams
+    socki = ctx.socket(zmq.SUB)
+    socki.setsockopt(zmq.RCVHWM, 100)
+
+    if type(args.topics) == list:
+        for topic in args.topics:
+            print('Ingress: Setting a topic filter "{}"'.format(topic))
+            socki.setsockopt_string(zmq.SUBSCRIBE, topic)
+
+    if type(args.ingress_binds) == list:
+        for addr in args.ingress_binds:
+            print('Ingress: Binding to "{}"'.format(addr))
+            socki.bind(addr)
+
+    elif type(args.ingress_connects) == list:
+        for addr in args.ingress_connects:
+            print('Ingress: Connecting to "{}"'.format(addr))
+            socki.connect(addr)
+
+    poller = zmq.Poller()
+    poller.register(socki, zmq.POLLIN)
+
+    # Stats of the collected streams
+    received = 0
+    dropped = 0
+    delayed = 0.0
+
+    last_stats_dumped = now = time.time()
+
+    # Inhibition control
+    last_dumped = 0
+
+    # Log file dump control (0 means no log file exists yet)
+    log_file_start_time = 0
+
+    while not stopped:
+
+        # Show the stats
+        if 0.0 < args.stats_interval and last_stats_dumped + args.stats_interval < now:
+            duration = now - last_stats_dumped
+            delayed_ave = (delayed / received) if received > 0 else 0.0
+            in_fps = (received - dropped) / duration
+
+            if args.stats_interval >= 0.0:
+                print('{} received {} dropped | interval {:.3f}s | fps {:.3f} in | delay {:.6f}'
+                      .format(received, dropped, duration, in_fps, delayed_ave), flush=True)
+
+            received = 0
+            dropped = 0
+            delayed = 0.0
+            last_stats_dumped = now
+
+
+        events = dict(poller.poll(POLL_WAIT_TIME))
+        now = time.time()
+
+        if log_file_start_time > 0 and log_file_start_time + args.log_dump_interval < now:
+            close_log_file(log_file_start_time)
+            log_file_start_time = 0
+
+        if events.get(socki) != zmq.POLLIN:
+            continue    # Poller time out
+
+
+        # Receive a message
+        msg = socki.recv_multipart(flags=zmq.NOBLOCK)
+        if not msg:
+            continue
+        received += 1
+
+        # Decode the message
+        try:
+            topic       = msg[0]  # bytes
+            source_id   = msg[1]  # bytes
+            frame_time  = pickle.loads(msg[2])
+
+            dprint(4,'Received: topic {} source_id {} ftime {:.3f}'
+                     .format(topic, source_id, frame_time), flush=True)
+
+            if topic.endswith(b'/' + source_id):
+                # Separate out the source ID from the topic
+                topic = topic[:-(len(source_id)+1)]
+
+            if topic == TOPIC_VIDEO_FRAME or topic == TOPIC_JPEG_FRAME:
+                meta        = pickle.loads(msg[3])
+                img         = numpy.frombuffer(memoryview(msg[4]), dtype=meta['dtype'])
+                img         = img.reshape(meta['shape'])
+                annotation  = pickle.loads(msg[5])
+
+
+                if topic == TOPIC_JPEG_FRAME:
+                    img = cv2.imdecode(img, cv2.IMREAD_COLOR)
+
+                item        = (img, annotation)
+
+            elif topic == TOPIC_LOG_FRAME:
+                item        = (numpy.array([]), pickle.loads(msg[3]))
+
+            else:
+                dprint(4,'Ignoring a message by topic: {} (len {})'
+                          .format(topic, len(msg)))
+                dropped += 1
+                continue
+
+        except pickle.UnpicklingError as e:
+            print('Corrupted pickle message: topic {}, source {}, {}'
+                  .format(topic, source_id, e))
+            dropped += 1
+            continue
+        except IndexError as e:
+            print('Invalid length: topic {}, source {}, length {}, {}'
+                  .format(topic, source_id, len(msg)))
+            dropped += 1
+            continue
+        except ValueError as e:
+            print('Invalid value: topic {}, source {}, {}'
+                  .format(topic, source_id, e))
+            dropped += 1
+            continue
+
+
+        # Accumulate the delay
+        delayed += (now - frame_time)
+
+
+        # Dump the message to files
+        if last_dumped + args.inhibition <= now:
+            if log_file_start_time == 0:
+                log_file_start_time = frame_time
+
+            if item[0].size > 0:
+                save_one_image(source_id.decode(), frame_time, *item)
+            if type(item[1]) is dict:
+                save_one_annotation(log_file_start_time, source_id.decode(), frame_time, item[1])
+
+            last_dumped = now
+
+
+        # Dump the message to imshow()
+        if item[0].size > 0:
+            if args.imshow:
+                img = numpy.copy(item[0])
+                imgq_.put((source_id, img), block=False)
+
+        if not args.quiet:
+            item[1]['source_id'] = source_id.decode()
+            item[1]['frame_time'] = frame_time
+            print('{}'.format(json.dumps(item[1], **json_opts)), flush=True)
+
+    # Clean up for this thread
+    socki.setsockopt(zmq.LINGER, 0)
+    socki.close()
+    close_log_file(log_file_start_time)
+
+    dprint(4,'Exiting the stream subscriber.')
+
+
+print('Starting the stream subscriber thread now ...\n')
+stream_subscriber = threading.Thread(target=subscribe_streams, args=[imgq])
+stream_subscriber.start()
+
+
+
+
+# --------------------------------
+# Main thread for OpenCV imshow
+# --------------------------------
+WAIT_TIME=30            # milliseconds (determine the maximum FPS to imshow)
+
+
+# The main thread handles window events
+
+
+try:    # for KeyboardInterrupt
+
+    win = False
+
+    while True:
+
+        # Extract the latest images received during cv2.waitKey
+        latest_images = {}
+        try:
+            while True:
+                source_id, img = imgq.get(block=False)
+                latest_images[source_id] = img
+        except queue.Empty:
+            pass
+
+        if not latest_images and not win:
+            time.sleep(WAIT_TIME / 1000)
+            continue
+
+        win = True
+
+        # Draw the latest images
+        for source_id, img in latest_images.items():
+            h,w,*_ = img.shape
+            win_title="{}: {}x{}".format(source_id, w, h)
+            cv2.imshow(win_title, img)
+
+        # Handle the window events
+        key = cv2.waitKey(WAIT_TIME)
+        if key == 27:
+            break
+
+        # FIXME:
+        # If all windows are closed by the user, win is still True but
+        # cv2.waitKey() returns immediately, falling into a busy loop
+
+except KeyboardInterrupt:
+    print("\nKeyboardInterrupt\n", file=sys.stderr, flush=True)
+
+
+# Clean up
+dprint(1,'Waiting the stream_subscriber to join ...')
+stopped = True
+stream_subscriber.join()
+
+ctx.term()
+
+# EOF
